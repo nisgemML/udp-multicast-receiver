@@ -8,10 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mtune=native -DNDEBUG")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -march=native -g -DNDEBUG")
 
-add_compile_options(
-    -Wall -Wextra -Wpedantic
-    -Wno-unused-parameter
-)
+add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 
 option(ASAN "Enable AddressSanitizer" OFF)
 if(ASAN)
@@ -26,23 +23,28 @@ if(TSAN)
 endif()
 
 find_package(Threads REQUIRED)
-find_library(PCAP_LIB pcap REQUIRED)
+find_library(PCAP_LIB pcap)
 
-# ── Header-only core library (no .cpp files — everything is in headers) ────────
+# ── Header-only core library ──────────────────────────────────────────────────
 
 add_library(feed_iface INTERFACE)
 target_include_directories(feed_iface INTERFACE include)
-target_link_libraries(feed_iface INTERFACE Threads::Threads ${PCAP_LIB})
+target_link_libraries(feed_iface INTERFACE Threads::Threads)
 
-# ── main receiver binary ──────────────────────────────────────────────────────
+# ── Optional binaries (require libpcap) ──────────────────────────────────────
 
-add_executable(receiver src/main.cpp)
-target_link_libraries(receiver PRIVATE feed_iface)
+if(PCAP_LIB)
+    message(STATUS "libpcap found: ${PCAP_LIB}")
+    target_link_libraries(feed_iface INTERFACE ${PCAP_LIB})
 
-# ── PCAP generator tool ───────────────────────────────────────────────────────
+    add_executable(receiver src/main.cpp)
+    target_link_libraries(receiver PRIVATE feed_iface)
 
-add_executable(gen_pcap tools/gen_pcap.cpp)
-target_link_libraries(gen_pcap PRIVATE feed_iface)
+    add_executable(gen_pcap tools/gen_pcap.cpp)
+    target_link_libraries(gen_pcap PRIVATE feed_iface)
+else()
+    message(STATUS "libpcap not found — skipping receiver and gen_pcap binaries")
+endif()
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
