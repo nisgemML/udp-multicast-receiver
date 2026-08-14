@@ -75,7 +75,7 @@ static void test_mold_header_heartbeat() {
     put_be16(buf + 18, 0);    // heartbeat
 
     MoldHeader hdr;
-    hdr.parse(buf, 20);
+    (void)hdr.parse(buf, 20);
     CHECK(hdr.is_heartbeat(), "heartbeat detected");
     CHECK(hdr.seq_num == 0, "heartbeat seq_num == 0");
 }
@@ -92,7 +92,7 @@ static void test_mold_header_round_trip() {
     orig.serialise(buf);
 
     MoldHeader parsed;
-    parsed.parse(buf, 20);
+    (void)parsed.parse(buf, 20);
 
     CHECK(parsed.seq_num   == orig.seq_num,   "seq_num round-trip");
     CHECK(parsed.msg_count == orig.msg_count, "msg_count round-trip");
