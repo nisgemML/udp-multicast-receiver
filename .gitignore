@@ -1,4 +1,6 @@
 build/
+build-debug/
+build-asan/
 *.o
 *.a
 *.out

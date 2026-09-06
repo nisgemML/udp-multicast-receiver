@@ -97,6 +97,13 @@ struct MoldMessage {
     uint16_t       length;    // body length in bytes
     const uint8_t* body;      // pointer into the original buffer — zero-copy
     uint64_t       seq_num;   // global sequence number, assigned by the parser
+    uint64_t       recv_ns = 0; // receive timestamp (CLOCK_MONOTONIC ns) of the
+                                 // packet this message arrived in — same value
+                                 // for every message in one datagram, and
+                                 // preserved even if the message was held in
+                                 // GapBuffer's out-of-order buffer before
+                                 // delivery. This is the anchor for tick-to-trade
+                                 // latency measurement downstream.
 };
 
 // ── ITCH 5.0 message types ────────────────────────────────────────────────────
@@ -187,6 +194,49 @@ struct ItchOrderExecuted {
         out.order_ref       = be64(body + 11);
         out.executed_shares = be32(body + 19);
         out.match_number    = be64(body + 23);
+        return true;
+    }
+};
+
+// Order Cancel ('X') — partial cancel, reduces resting shares without
+// removing the order. Body: type(1) ts(6) locate(2) tracking(2) order_ref(8)
+// cancelled_shares(4) = 23.
+struct ItchOrderCancel {
+    uint64_t seq_num;
+    uint64_t timestamp_ns;
+    uint64_t order_ref;
+    uint32_t cancelled_shares;
+
+    [[nodiscard]] static bool parse(const uint8_t* body, std::size_t len,
+                                     ItchOrderCancel& out) noexcept {
+        if (len < 23) return false;
+        out.timestamp_ns      = be48(body + 1);
+        out.order_ref         = be64(body + 11);
+        out.cancelled_shares  = be32(body + 19);
+        return true;
+    }
+};
+
+// Order Replace ('U') — atomically deletes orig_order_ref and adds a new
+// order at new_order_ref with a fresh price/shares (used for order
+// modifications). Body: type(1) ts(6) locate(2) tracking(2)
+// orig_order_ref(8) new_order_ref(8) shares(4) price(4) = 35.
+struct ItchOrderReplace {
+    uint64_t seq_num;
+    uint64_t timestamp_ns;
+    uint64_t orig_order_ref;
+    uint64_t new_order_ref;
+    uint32_t shares;
+    uint32_t price;
+
+    [[nodiscard]] static bool parse(const uint8_t* body, std::size_t len,
+                                     ItchOrderReplace& out) noexcept {
+        if (len < 35) return false;
+        out.timestamp_ns    = be48(body + 1);
+        out.orig_order_ref  = be64(body + 11);
+        out.new_order_ref   = be64(body + 19);
+        out.shares          = be32(body + 27);
+        out.price           = be32(body + 31);
         return true;
     }
 };

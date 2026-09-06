@@ -14,6 +14,7 @@
 // This is the same approach as HDR Histogram but simplified for <1ms ranges.
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <bit>

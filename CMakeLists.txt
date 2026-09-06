@@ -31,6 +31,14 @@ add_library(feed_iface INTERFACE)
 target_include_directories(feed_iface INTERFACE include)
 target_link_libraries(feed_iface INTERFACE Threads::Threads)
 
+# ── Benchmarks (no libpcap dependency) ────────────────────────────────────────
+
+add_executable(tick_to_trade_bench tools/tick_to_trade_bench.cpp)
+target_link_libraries(tick_to_trade_bench PRIVATE feed_iface)
+
+add_executable(timestamp_validate tools/timestamp_validate.cpp)
+target_link_libraries(timestamp_validate PRIVATE feed_iface)
+
 # ── Optional binaries (require libpcap) ──────────────────────────────────────
 
 if(PCAP_LIB)
@@ -61,3 +69,15 @@ add_test(NAME GapBuffer COMMAND test_gap_buffer)
 add_executable(test_pcap_replay tests/test_pcap_replay.cpp)
 target_link_libraries(test_pcap_replay PRIVATE feed_iface)
 add_test(NAME PcapReplay COMMAND test_pcap_replay)
+
+add_executable(test_order_book tests/test_order_book.cpp)
+target_link_libraries(test_order_book PRIVATE feed_iface)
+add_test(NAME OrderBook COMMAND test_order_book)
+
+add_executable(test_feed_arbitrator tests/test_feed_arbitrator.cpp)
+target_link_libraries(test_feed_arbitrator PRIVATE feed_iface)
+add_test(NAME FeedArbitrator COMMAND test_feed_arbitrator)
+
+add_executable(test_decision_engine tests/test_decision_engine.cpp)
+target_link_libraries(test_decision_engine PRIVATE feed_iface)
+add_test(NAME DecisionEngine COMMAND test_decision_engine)

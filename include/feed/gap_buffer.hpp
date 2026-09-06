@@ -62,6 +62,10 @@ struct BufferedPacket {
     uint16_t msg_count = 0;
     bool     occupied  = false;
     uint16_t data_len  = 0;
+    uint64_t recv_ns   = 0;          // original packet arrival time, preserved
+                                      // across buffering so downstream latency
+                                      // measurement reflects true wire arrival,
+                                      // not flush time.
     uint8_t  data[kMaxPacketBytes];  // raw MoldUDP64 payload (after the 20-byte header)
 };
 
@@ -151,7 +155,7 @@ public:
         }
 
         // In-order (or partial overlap with duplicate prefix).
-        int delivered = deliver_packet(hdr, payload, len);
+        int delivered = deliver_packet(hdr, payload, len, now_ns);
         delivered    += flush_buffer();
         // Clear gap tracker if next_expected_ has advanced past all missing seqs.
         // next_expected_ only advances by delivering in-order messages, so when
@@ -239,7 +243,7 @@ private:
     // ── Packet buffering ──────────────────────────────────────────────────────
 
     void buffer_packet(const MoldHeader& hdr, const uint8_t* payload,
-                       std::size_t len, uint64_t /*now_ns*/) noexcept
+                       std::size_t len, uint64_t now_ns) noexcept
     {
         const uint64_t slot_idx = hdr.seq_num & kMask;
         auto& slot = slots_[slot_idx];
@@ -255,6 +259,7 @@ private:
         slot.occupied  = true;
         slot.seq_num   = hdr.seq_num;
         slot.msg_count = hdr.msg_count;
+        slot.recv_ns   = now_ns;
         // Copy the message payload (everything after the 20-byte MoldHeader).
         const std::size_t body_offset = kMoldHeaderSize;
         const std::size_t body_len    = (len > body_offset)
@@ -268,7 +273,7 @@ private:
 
     // Deliver all messages in a freshly-received in-order packet.
     int deliver_packet(const MoldHeader& hdr, const uint8_t* payload,
-                       std::size_t len) noexcept
+                       std::size_t len, uint64_t recv_ns) noexcept
     {
         int count = 0;
         const uint8_t* cursor = payload + kMoldHeaderSize;
@@ -281,7 +286,7 @@ private:
             if (cursor + msg_len > end) break;
 
             if (seq >= next_expected_) {
-                MoldMessage msg{ msg_len, cursor, seq };
+                MoldMessage msg{ msg_len, cursor, seq, recv_ns };
                 if (on_message_) on_message_(msg);
                 ++count;
                 ++stat_delivered_;
@@ -312,7 +317,8 @@ private:
             hdr.serialise(buf);
             std::memcpy(buf + kMoldHeaderSize, slot.data, slot.data_len);
 
-            count += deliver_packet(hdr, buf, kMoldHeaderSize + slot.data_len);
+            count += deliver_packet(hdr, buf, kMoldHeaderSize + slot.data_len,
+                                     slot.recv_ns);
 
             slot.occupied = false;
 
