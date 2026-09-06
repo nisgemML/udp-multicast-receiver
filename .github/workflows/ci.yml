@@ -8,12 +8,21 @@ on:
 
 jobs:
   build-test:
-    name: Build + Test (${{ matrix.build_type }})
+    name: Build + Test (${{ matrix.name }})
     runs-on: ubuntu-22.04
 
     strategy:
       matrix:
-        build_type: [Release, Debug]
+        include:
+          - name: Release
+            build_type: Release
+            asan: OFF
+          - name: Debug
+            build_type: Debug
+            asan: OFF
+          - name: Debug+ASan
+            build_type: Debug
+            asan: ON
 
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +36,8 @@ jobs:
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DASAN=${{ matrix.asan }}
 
       - name: Build
         run: cmake --build build --parallel

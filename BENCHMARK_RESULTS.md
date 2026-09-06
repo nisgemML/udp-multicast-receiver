@@ -22,7 +22,11 @@ ctest --output-on-failure --timeout 30   # 6/6 tests, 202 assertions
 binaries were also run clean under AddressSanitizer
 (`-DASAN=ON -DCMAKE_BUILD_TYPE=Debug`) and under a separate Debug build —
 zero failures, zero sanitizer reports, zero compiler warnings under
-`-Wall -Wextra -Wpedantic` across all three configurations.
+`-Wall -Wextra -Wpedantic` across all three configurations. This is not
+a one-off, manually-run claim: `.github/workflows/ci.yml` runs all three
+configurations (Release, Debug, Debug+ASan) on every push and pull
+request, so a future regression in any of them fails CI, not just this
+document.
 
 ---
 
