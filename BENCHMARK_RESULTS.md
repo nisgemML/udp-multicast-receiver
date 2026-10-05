@@ -1,8 +1,9 @@
 # Benchmark Results — UDP Multicast Market Data Receiver
 
-All results in this document were produced by actually running the code in
-this repo, in this environment — nothing here is estimated or asserted
-without a run backing it. Where a number can't honestly be produced in
+Every measured number in this document was produced by running the code in
+this repo. Figures that are design estimates or vendor specifications are
+labelled as such inline, so a measured number and an asserted one never
+look alike. Where a number can't honestly be produced in
 this environment (real NIC hardware timestamping, live multicast over a
 real network), that's stated explicitly rather than filled in with a
 plausible-looking figure. Reproducible:
@@ -11,14 +12,15 @@ plausible-looking figure. Reproducible:
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
-ctest --output-on-failure --timeout 30   # 6/6 tests, 202 assertions
+ctest --output-on-failure --timeout 30   # 6/6 tests, 226 assertions
 
 # Benchmarks (no live feed needed):
 ./tick_to_trade_bench --messages 200000 --warmup 20000 --symbols 8
 ./timestamp_validate --count 20000
 ```
 
-**Environment:** Ubuntu 24.04, GCC 13.3, x86-64 container. All test
+**Environment:** Ubuntu 24.04, GCC 13.3, x86-64 container with **one vCPU**
+(no core isolation, no `SCHED_FIFO`) — relevant to every tail number below. All test
 binaries were also run clean under AddressSanitizer
 (`-DASAN=ON -DCMAKE_BUILD_TYPE=Debug`) and under a separate Debug build —
 zero failures, zero sanitizer reports, zero compiler warnings under
@@ -33,17 +35,19 @@ document.
 ## Test results
 
 ```
-6/6 tests passed (202 assertions total)
+6/6 tests passed (226 assertions total)
 
-  test_wire_format      : 38 passed, 0 failed
+  test_wire_format      : 62 passed, 0 failed
                            (byte-order helpers, MoldHeader parse/round-trip,
-                            ITCH decode for all 5 book-affecting opcodes)
+                            hand-written ITCH 5.0 golden vectors for all 5
+                            book-affecting opcodes: A, D, X, E, U)
   test_gap_buffer        : 45 passed, 0 failed
-                           (gap detection, sequence tracking, retransmit request
-                            generation, 200µs timeout boundary, duplicate handling)
+                           (in-order delivery, duplicate drop, gap detection,
+                            out-of-order flush, retransmit timing at a 500µs
+                            configured timeout, heartbeats, multi-message packets)
   test_pcap_replay       : 26 passed, 0 failed
-                           (MoldUDP64 header parse, ITCH 5.0 message decode,
-                            48-bit timestamp reconstruction, all message types)
+                           (PCAP write/read round-trip, gap in a PCAP file,
+                            heartbeat filtering, port filter, multi-message)
   test_order_book        : 62 passed, 0 failed
                            (order lifecycle, price-level aggregation, multi-symbol
                             routing, top-of-book callbacks, end-to-end GapBuffer
@@ -56,11 +60,30 @@ document.
                             end-to-end OrderBook wiring)
 ```
 
-Note: an earlier version of this document reported "71 assertions total"
-for what was then a 3-suite run, but the sum of the two suites actually
-listed (45 + 26 = 71) silently excluded `test_wire_format`'s 38
-assertions from both the total and the list. Fixed above — this file
-lists every suite that actually runs.
+---
+
+## A spec-conformance bug that every test passed
+
+The ITCH 5.0 decoder originally had the wrong byte layout. Every ITCH 5.0
+message starts `type | stock locate (2) | tracking number (2) | timestamp
+(6)`, with message fields from offset 11. The old `ItchAddOrder` omitted
+Locate and Tracking entirely (order ref at offset 7 instead of 11, price
+at 28 instead of 32), and every message type read its timestamp from
+offset 1 instead of 5. Against a real NASDAQ capture it would have
+mis-decoded every Add Order.
+
+All 202 assertions passed anyway, because every test fixture and tool
+built its messages with the same wrong layout — encoder and decoder
+agreed with each other, and nothing compared either one to the spec.
+
+The fix is two parts: correct offsets in `wire_format.hpp` (with the
+common prefix as named constants), and golden byte vectors in
+`test_wire_format.cpp` typed by hand from the spec tables rather than
+produced by any helper in this repo. Checked that they bite: compiling
+the new golden tests against the **original** decoder gives
+`50 passed, 11 failed` — exactly the timestamp/order-ref/side/shares/
+stock/price fields that were mis-positioned.
+
 
 ---
 
@@ -119,42 +142,61 @@ crashing:
 
 ## Tick-to-trade software latency
 
-`tools/tick_to_trade_bench` wires `GapBuffer → MultiSymbolBook →
-DecisionEngine` and measures `decided_ns - recv_ns` for every decision
-emitted, where both timestamps are `CLOCK_MONOTONIC` reads in the same
-process. **Read this section's caveat before quoting these numbers
-anywhere** — see below.
+`tools/tick_to_trade_bench` drives synthetic MoldUDP64 packets through
+`GapBuffer → MultiSymbolBook → DecisionEngine`. Two quantities, both from
+`CLOCK_MONOTONIC` reads in the same process, both with **exact**
+percentiles (every sample stored and sorted, nearest-rank):
 
-Actual run, this machine, 200,000 messages (+20,000 warmup, discarded),
+- **Per message:** wall time of one `GapBuffer::ingest()` call. The book
+  update and decision rule run synchronously inside it via callbacks, so
+  this is the whole parse → book → decision path for that message — not
+  parse alone. (An earlier version labelled this "GapBuffer.ingest()
+  only", which was wrong.)
+- **recv → decision:** `decided_ns − recv_ns` for the subset of messages
+  that changed top of book and passed the decision rule.
+
+Three consecutive runs, 200,000 messages (+20,000 warmup, discarded),
 8 symbols:
 
 ```
-Symbols in book    : 8
-Top-of-book events : 4500
-Decisions emitted  : 4472
+Per message (n=200,000)            p50     p90     p99     p99.9    mean
+  run 1                            377     764    1402     5151      587
+  run 2                            368     782    1476     5176      584
+  run 3                            370     772    1408     5596      581
 
-GapBuffer.ingest() only            count=200000  mean= 683ns  p50= 256ns  p99=1024ns  p99.9= 8192ns
-recv -> decision (full pipeline)   count=  4472  mean= 293ns  p50= 256ns  p99= 256ns  p99.9=  256ns
+recv -> decision (n=3,942)         p50     p90     p99     p99.9    mean
+  run 1                            397     783    1364    13198     1078
+  run 2                            392     800    1623    20161     1006
+  run 3                            394     786    1327     4160     1052
+                                                              (all ns)
 ```
 
-(Run-to-run variance observed: a second run at lower message count, 50k,
-showed mean ~2.2µs / p99.9 ~16µs for the pure ingest path and mean ~3.0µs
-/ p99.9 ~65µs for the full pipeline — smaller sample sizes and container
-scheduling noise both move the tail meaningfully. Treat p50/mean as the
-stable numbers and the tail as environment-dependent, not a fixed
-property of the code.)
+How to read these: p50–p99 are stable run to run; p99.9 and the mean
+are not. Each run's max is ~2–8 ms, which is scheduler preemption on a
+single shared vCPU, and a handful of those samples is enough to pull
+the decision-path mean above 1 µs and move its p99.9 by 5x. On an
+isolated core (`docs/linux-tuning.md`) the tail is the thing that should
+change; on this box it isn't a property of the code.
 
-**What this number is not, stated plainly:** this does not touch a NIC,
-does not include network wire transit, and is not a co-location
-tick-to-trade figure comparable to what a real HFT firm quotes. It is a
-genuine, reproducible measurement of this process's own parse → book
-update → decision-rule cost, on this CPU, right now — nothing more, and
-that's stated in the tool's own output banner too, not just here. See
-`include/feed/decision_engine.hpp`'s header comment for why PCAP-embedded
-timestamps specifically cannot be used for this measurement (they're
-original capture time, not "now" — subtracting a live clock read from
-that would produce a number that looks like a latency figure but isn't
-one).
+(4,472 decisions are emitted in total; 3,942 is the post-warmup count
+actually recorded.)
+
+**Correction to earlier numbers.** A previous version of this file
+reported `p50=256 p99=256 p99.9=256 mean=293` for the decision path.
+Those came from `LatencyHistogram`, which bucketed by power of two and
+reported each bucket's **lower** bound — so "256" meant "somewhere in
+256–511", and a p99.9 below the mean was a symptom of that, not a
+result. The live-path histogram now reports the bucket's exclusive upper
+bound (a true "< X" statement), and the benchmarks use exact
+percentiles.
+
+**What this number is not:** it does not touch a NIC, does not include
+wire transit, and is not a co-location tick-to-trade figure comparable
+to what a trading firm quotes. It is this process's own parse → book →
+decision cost on this CPU, and the tool's output banner says so too. See
+`include/feed/decision_engine.hpp` for why PCAP-embedded timestamps
+can't be used for this measurement (they're capture time, not "now").
+
 
 ---
 
@@ -168,19 +210,21 @@ consistency matters here (the kernel's software timestamp is
 realtime-based, not monotonic, so comparing it against a monotonic
 userspace read would silently mix clock domains).
 
-Actual run, this machine, 20,000 round-trips:
+Actual run, this machine, 20,000 round-trips (exact percentiles, ns):
 
 ```
-Missing SW timestamp   : 1
+Missing SW timestamp   : 0
 HW timestamp populated : 0 (expected — see below)
 
-send -> kernel_rx_sw_ts    count=19999  mean= 670ns  p50= 512ns  p99=1024ns  p99.9= 4096ns
-kernel_rx_sw_ts -> read    count=19999  mean=1349ns  p50=1024ns  p99=1024ns  p99.9=16384ns
+                           p50     p90     p99     p99.9    mean
+send -> kernel_rx_sw_ts    625     737    1160    11629      686
+kernel_rx_sw_ts -> read   1243    1528    1945    18430     1343
 ```
 
 `kernel_rx_sw_ts -> read` — the scheduler wake-up gap between the
 kernel timestamping the packet and userspace actually reading it — runs
-roughly 2x the pure kernel-receive-queue transit time in this
+about 2x the kernel-receive-queue transit time (p50 1.24 µs vs
+0.63 µs) in this
 environment. That's a real, measured demonstration of exactly the
 problem `receiver.hpp`'s design notes describe: an application-level
 `gettimeofday()`-at-read timestamp would silently include this gap in
@@ -204,24 +248,19 @@ support.
 
 ---
 
-## Parse throughput
+## Parse cost (design estimate, not measured)
 
-MoldUDP64 header + ITCH 5.0 Add Order parse pipeline (userspace only):
+The header + Add Order decode is a handful of big-endian loads
+(`__builtin_bswap*` compiles to `BSWAP`/`MOVBE`), so the decode itself
+should cost on the order of tens of cycles. **That is an estimate from
+instruction count, not a measurement** — this repo does not have a
+parse-only microbenchmark, and the per-message figure above (p50 ~370 ns)
+covers much more than decode: sequence tracking, dedup, two
+`std::function` callback hops, the order-book update (hash-map lookups
+on order ref and symbol), the decision rule, and two `clock_gettime`
+calls. A parse-only benchmark is the right next step before quoting any
+decode number.
 
-**Design:** The parse path is deliberately minimal — every operation maps to
-a single x86 instruction:
-- `__builtin_bswap64` → `BSWAP r64` (1 cycle)
-- `__builtin_bswap32` → `BSWAP r32` (1 cycle)
-- 48-bit timestamp assembly → 6 byte loads + 5 shifts (6 cycles)
-- Gap detection → 1 comparison + 1 branch (1 cycle)
-
-Total parse cost per Add Order message: ~15–20 cycles (~7–10ns at 2GHz),
-matching the theoretical instruction count above. This is narrower than
-what `tick_to_trade_bench`'s "GapBuffer.ingest() only" figure measures
-above (mean ~683ns) — that figure includes GapBuffer's full sequence-
-tracking, dedup-check, and (when applicable) buffering path around the
-parse, not just the header/message parse in isolation. Both numbers are
-real; they're measuring different scopes of the same code path.
 
 ---
 
@@ -246,7 +285,7 @@ the kernel networking stack, eliminating scheduler jitter entirely.
 
 Without hardware timestamping, a software receive timestamp can be delayed by
 scheduler jitter — this repo's own measured `kernel_rx_sw_ts -> read` figure
-above (mean ~1.3µs, p99.9 ~16µs on an idle container) is a real instance of
+above (p50 ~1.2µs, p99.9 ~18µs on an idle container) is a real instance of
 exactly that jitter, on the low end of what a loaded production machine would
 show. This is the same goal as kernel bypass (DPDK/RDMA) but achieved from
 the kernel side: the packet still goes through the kernel stack, but the
@@ -259,57 +298,42 @@ timestamp is captured at the NIC before any kernel processing occurs.
 
 ---
 
-## Gap detection design rationale
+## Gap detection timeout and receive buffer sizing
 
-**200µs timeout** (configurable, default in `src/main.cpp`):
+**Gap timeout.** `GapBuffer::Config` defaults to `gap_timeout_ns` = 100 µs
+and `retry_interval_ns` = 1 ms; the `receiver` binary overrides these to
+200 µs / 2 ms. The timeout is a debounce: it trades a little recovery
+latency for not firing retransmit requests on packets that are merely
+reordered. The right value depends on the venue's observed reordering
+distribution, which can't be measured here — **both defaults are
+judgment calls, not tuned values.** What *is* tested is the mechanism:
+`test_retransmit_request_timing` (configured at 500 µs) checks that no
+request fires before the timeout and one fires after it.
 
-The 200µs gap timeout was chosen as:
-- 4× the typical co-location jitter (50µs p99 for NASDAQ ITCH — a venue
-  network characteristic, not measured in this environment)
-- Below the 1ms threshold at which a strategy decision would be impacted
-- Above the 100µs threshold at which false gap-detects become frequent
+**Receive buffer.** `MulticastReceiver` requests an 8 MB `SO_RCVBUF`.
+How long that absorbs a stall is `buffer / (packet rate × per-packet
+kernel cost)`, where per-packet cost is the datagram plus `skb`
+overhead, typically well above the ITCH payload. Rather than quote a
+duration from guessed inputs, the useful, checkable fact is this one:
+**Linux silently clamps `SO_RCVBUF` to `net.core.rmem_max`.** Measured
+in this container (`rmem_max` = 4 MB): an 8 MB `SO_RCVBUF` request was
+granted 4 MB; `SO_RCVBUFFORCE` got the full 8 MB. On a stock kernel the
+cap is ~208 KB. `open()` now tries `SO_RCVBUFFORCE`, falls back, reads
+the granted size back, and exposes `recv_buffer_shortfall()`; the
+`receiver` binary warns on it. See `docs/linux-tuning.md` §5a.
 
-These are design-rationale figures based on published NASDAQ co-location
-characteristics, not numbers reproduced by a test in this repo — unlike
-the sections above, there is no practical way to generate real co-location
-jitter in this environment to validate them against. `test_gap_buffer.cpp`
-does verify the 200µs boundary behavior itself (that a request fires
-exactly at the configured timeout, not before or long after) — that
-mechanism is tested; the specific 200µs value's fitness for a real venue
-is a documented judgment call, not a measured one.
-
-**SO_RCVBUF = 8MB:**
-
-At NASDAQ peak (5M messages/sec, ~250 bytes/message), 8MB absorbs
-~16ms of traffic without drops. This provides headroom for:
-- Burst absorption during market open (first 30 seconds)
-- Gap retransmit round-trip latency (~200µs in co-location)
 
 ---
 
-## Source-specific multicast (SSM) performance
+## Source-specific multicast (SSM)
 
-`IP_ADD_SOURCE_MEMBERSHIP` drops non-matching multicast at the NIC/kernel
-boundary before the packet reaches userspace.
-
-| Mode | Userspace CPU | Kernel CPU |
-|---|---|---|
-| ASM (any-source) | 100% (all multicast) | Moderate |
-| SSM (source-specific) | **~3%** (design estimate) | Minimal |
-
-These figures were not re-measured for this update — this sandboxed
-environment does not support multicast routing on loopback (verified
-directly: a loopback multicast send/receive test produced no delivered
-packet), so live multicast socket behavior, ASM vs SSM overhead included,
-could not be exercised end-to-end here. The socket-option-level code
-(`IP_ADD_MEMBERSHIP` vs `IP_ADD_SOURCE_MEMBERSHIP`, `SO_TIMESTAMPING`
-flags, etc.) is exercised and correct per `MulticastReceiver`'s
-implementation and compiles/links cleanly; the live multicast data path
-itself needs validation on a host or container with multicast routing
-enabled, or against a real NASDAQ-style feed.
-
-SSM filtering remains the correct choice for production market data feeds
-where the source IP is known at configuration time (as it always is for
-NASDAQ, CME, and similar venues) — that architectural claim doesn't
-depend on the specific CPU percentages above.
-
+`IP_ADD_SOURCE_MEMBERSHIP` has the kernel drop multicast from other
+sources before it reaches the socket, so with SSM the application only
+pays for the traffic it subscribed to. The size of that saving depends
+entirely on what else is on the group, so **this repo makes no CPU
+figure for it.** It also can't exercise live multicast at all: this
+sandbox has no multicast routing on loopback (verified: a loopback
+multicast send/receive delivered nothing). The socket-option code is
+compiled and linked, but the live multicast data path, ASM and SSM
+alike, still needs validation on a host with multicast routing or
+against a real feed.

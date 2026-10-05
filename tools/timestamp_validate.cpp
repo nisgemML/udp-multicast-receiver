@@ -145,8 +145,8 @@ int main(int argc, char* argv[]) {
         std::perror("SO_TIMESTAMPING"); return 1;
     }
 
-    LatencyHistogram send_to_kernel;
-    LatencyHistogram kernel_to_read;
+    SampleRecorder send_to_kernel(static_cast<std::size_t>(count));
+    SampleRecorder kernel_to_read(static_cast<std::size_t>(count));
     int missing_ts = 0;
     int hw_ts_seen = 0;
 

@@ -162,6 +162,14 @@ public:
     [[nodiscard]] uint64_t stat_messages_delivered() const noexcept { return stat_messages_delivered_; }
     [[nodiscard]] uint64_t stat_parse_errors()       const noexcept { return stat_parse_errors_; }
 
+    // Kernel-reported receive buffer after open() (Linux reports 2x the
+    // usable size it was set to). recv_buffer_shortfall() is true when the
+    // kernel granted less than requested — almost always rmem_max clamping.
+    [[nodiscard]] int  granted_recv_buffer_bytes() const noexcept { return granted_recv_buffer_bytes_; }
+    [[nodiscard]] bool recv_buffer_shortfall()     const noexcept {
+        return granted_recv_buffer_bytes_ < 2LL * cfg_.recv_buffer_bytes;
+    }
+
 private:
     // ── Socket setup ──────────────────────────────────────────────────────────
 
@@ -176,10 +184,32 @@ private:
         }
 
         // Receive buffer — bump to reduce kernel-side drops during bursts.
-        if (::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF,
+        //
+        // SO_RCVBUF is SILENTLY clamped to net.core.rmem_max (stock kernels:
+        // ~208 KB), so asking for 8 MB on an untuned host quietly yields a
+        // fraction of it and no error. We therefore:
+        //   1. try SO_RCVBUFFORCE (ignores rmem_max; needs CAP_NET_ADMIN),
+        //   2. fall back to SO_RCVBUF,
+        //   3. read the size back and record what the kernel actually granted.
+        // Linux stores and reports double the requested value (bookkeeping
+        // overhead), so "granted" is compared against 2x the request.
+        // Callers should check recv_buffer_shortfall() after open(); see
+        // docs/linux-tuning.md for the rmem_max sysctl.
+        if (::setsockopt(fd_, SOL_SOCKET, SO_RCVBUFFORCE,
                          &cfg_.recv_buffer_bytes,
-                         sizeof(cfg_.recv_buffer_bytes)) < 0)
-            return report_error("SO_RCVBUF");
+                         sizeof(cfg_.recv_buffer_bytes)) < 0) {
+            if (::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF,
+                             &cfg_.recv_buffer_bytes,
+                             sizeof(cfg_.recv_buffer_bytes)) < 0)
+                return report_error("SO_RCVBUF");
+        }
+        {
+            int granted = 0;
+            socklen_t len = sizeof(granted);
+            if (::getsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &granted, &len) < 0)
+                return report_error("getsockopt(SO_RCVBUF)");
+            granted_recv_buffer_bytes_ = granted;
+        }
 
         // Software timestamps: taken when the packet enters the socket receive queue.
         if (cfg_.enable_software_timestamps) {
@@ -316,6 +346,7 @@ private:
     uint64_t stat_recv_calls_          = 0;
     uint64_t stat_messages_delivered_  = 0;
     uint64_t stat_parse_errors_        = 0;
+    int      granted_recv_buffer_bytes_ = 0;
 };
 
 } // namespace feed

@@ -154,6 +154,13 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "Failed to open multicast socket\n");
         return 1;
     }
+    if (receiver.recv_buffer_shortfall()) {
+        std::fprintf(stderr,
+            "WARNING: requested SO_RCVBUF %d bytes but kernel granted %d "
+            "(reported value is 2x usable). Raise net.core.rmem_max — see "
+            "docs/linux-tuning.md — or bursts will be dropped in the kernel.\n",
+            rcfg.recv_buffer_bytes, receiver.granted_recv_buffer_bytes());
+    }
 
     std::printf("Listening on %s:%u (interface %s)\n",
                 group.c_str(), port, iface.c_str());

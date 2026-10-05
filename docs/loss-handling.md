@@ -25,8 +25,8 @@ where the actual operational risk lives.
 ## 2. Single-line gap recovery, end to end
 
 1. A gap is detected: `on_gap` fires once, with the missing range.
-2. The gap sits in `GapBuffer`'s buffer for `gap_timeout_ns` (default
-   200µs) — this is a debounce window, not a real recovery attempt: most
+2. The gap sits in `GapBuffer`'s buffer for `gap_timeout_ns` (library
+   default 100µs; the `receiver` binary configures 200µs) — this is a debounce window, not a real recovery attempt: most
    gaps under ~100µs are reordering, not loss, and resolve themselves
    without a retransmit request ever being sent.
 3. If still missing after the timeout, `on_retransmit` fires with a
@@ -36,7 +36,8 @@ where the actual operational risk lives.
    the one piece of this pipeline that's genuinely venue-specific (host,
    port, auth, connection pooling all vary). Wire `on_retransmit` to your
    TCP client.
-4. If the gap is still open after `retry_interval_ns` (default 1ms), the
+4. If the gap is still open after `retry_interval_ns` (library default 1ms;
+   the `receiver` binary configures 2ms), the
    request is resent — capped at `max_retransmit_count` (default 100)
    sequences per request, so a gap larger than that is requested in
    multiple rounds.

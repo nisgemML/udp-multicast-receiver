@@ -153,6 +153,33 @@ Notes:
 
 ---
 
+## 5a. Socket receive buffer: the silent clamp
+
+`MulticastReceiver` asks for an 8 MB `SO_RCVBUF`. Linux silently caps
+`SO_RCVBUF` at `net.core.rmem_max` — no error, no log line. On a stock
+kernel that cap is ~208 KB, so an untuned host runs with a small
+fraction of the intended burst headroom and the first sign is
+`RcvbufErrors` climbing during the open.
+
+Measured in this repo's dev container (`rmem_max` = 4 MB, running as root):
+
+```
+setsockopt(SO_RCVBUF, 8 MB)      -> getsockopt reports 8,388,608  (4 MB usable: clamped)
+setsockopt(SO_RCVBUFFORCE, 8 MB) -> getsockopt reports 16,777,216 (8 MB usable)
+```
+
+(Linux reports double the usable size to account for bookkeeping
+overhead.) `MulticastReceiver::open()` therefore tries `SO_RCVBUFFORCE`
+first (needs `CAP_NET_ADMIN`), falls back to `SO_RCVBUF`, reads the
+granted size back, and exposes `recv_buffer_shortfall()`; the
+`receiver` binary prints a warning when it is true. The fix on the host:
+
+```bash
+sysctl -w net.core.rmem_max=16777216
+# verify drops during a burst, not just the setting:
+nstat -az UdpRcvbufErrors UdpInErrors
+```
+
 ## 6. What to verify after tuning, and with what
 
 None of the above is self-verifying — a misconfigured `isolcpus` range

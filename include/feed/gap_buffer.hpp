@@ -30,10 +30,19 @@
 //
 // ── Capacity choice ───────────────────────────────────────────────────────────
 //
-// NASDAQ ITCH at peak is ~10M messages/second.  At 1µs retransmit RTT,
-// a worst-case gap lasts ~10 messages.  We size the buffer at 4096 to
-// handle multi-millisecond gaps without dropping newly-arrived messages.
-// 4096 * sizeof(BufferedPacket) ≈ 4096 * 1500 bytes ≈ 6 MB — acceptable.
+// Slots are indexed by MoldUDP64 sequence number (which counts MESSAGES,
+// not packets), so the buffer covers a window of 4096 sequence numbers
+// past next_expected. How much wall-clock time that buys depends entirely
+// on the feed rate R: window = 4096 / R. At 1M msg/s that is ~4 ms; at a
+// 10M msg/s burst it is ~0.4 ms — SHORTER than a typical sub-millisecond-
+// to-millisecond retransmit round trip. So on a single line at peak burst
+// rate, a gap that needs a retransmit can overflow this buffer; the real
+// defence at those rates is A/B line arbitration (feed_arbitrator.hpp),
+// which fills most single-line gaps in microseconds without a retransmit.
+// Overflow is detected and counted (stat_buffer_overflows), never silent.
+//
+// Memory: 4096 * sizeof(BufferedPacket) = 4096 * 1528 B = 6,258,688 B
+// (~6.26 MB), allocated inline once, never on the hot path.
 
 #include "feed/wire_format.hpp"
 #include <array>

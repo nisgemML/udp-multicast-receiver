@@ -71,6 +71,13 @@ survive buffering). Big-endian helpers (`be16`, `be32`, `be48`, `be64`)
 use `__builtin_bswap*` to avoid the glibc `ntohl` conditional and stay
 free of POSIX socket headers.
 
+Field offsets follow the ITCH 5.0 common prefix (type, stock locate,
+tracking number, 6-byte timestamp; fields from offset 11) and are pinned
+by hand-typed golden byte vectors from the spec. An earlier version got
+this layout wrong and passed every test anyway, because the fixtures
+shared the parser's mistake — see `BENCHMARK_RESULTS.md` for how that
+was found and how the new tests were checked to catch it.
+
 ### `include/feed/gap_buffer.hpp`
 
 The core of the receiver. Maintains `next_expected_seq` and handles all three failure modes:
@@ -83,7 +90,7 @@ The core of the receiver. Maintains `next_expected_seq` and handles all three fa
 
 **Retransmit timing:** gap detected → wait `gap_timeout_ns` (default 100µs) before first request → retry every `retry_interval_ns` (default 1ms). Rate-limited to avoid flooding the retransmission server.
 
-**Buffer capacity:** 4096 slots (power-of-two for O(1) index via bitmask). At NASDAQ peak (~10M msg/sec), a 1ms retransmit RTT creates ~10,000 buffered messages — the 4096-slot buffer handles typical gaps while consuming ~6MB of pre-allocated memory. See `docs/loss-handling.md` §2 for what happens when a gap exceeds it.
+**Buffer capacity:** 4096 slots (power-of-two for O(1) index via bitmask), indexed by MoldUDP64 sequence number, so it spans 4096 *messages* past `next_expected` — ~6.26 MB pre-allocated inline. That window lasts 4096 / R seconds at feed rate R: ~4 ms at 1M msg/s, but only ~0.4 ms at a 10M msg/s burst, which is shorter than a typical retransmit round trip. So a single-line gap at peak burst rate *can* overflow it — that is a known, counted (`stat_buffer_overflows`) limit, and the reason A/B arbitration matters: it fills most single-line gaps without a retransmit at all. See `docs/loss-handling.md` §2 for what happens on overflow.
 
 **Gap closure:** when the missing sequence(s) arrive (via retransmit or natural delivery), `flush_buffer()` scans forward from `next_expected` and delivers all consecutive buffered packets. Each buffered slot keeps the original `recv_ns` of its packet, so a message delivered late (because it sat behind a gap) still carries its true arrival time downstream — not the time it happened to get flushed.
 
@@ -92,6 +99,8 @@ The core of the receiver. Maintains `next_expected_seq` and handles all three fa
 Live UDP multicast socket with `SO_TIMESTAMPING`. Key design decisions:
 
 **`SO_TIMESTAMPING` over `gettimeofday`:** application-level timestamps measure when userspace *reads* the packet (subject to scheduler jitter, ~100µs on a loaded system). `SOF_TIMESTAMPING_RX_SOFTWARE` moves the timestamp into the kernel receive path — taken when the packet enters the socket receive queue, ~1-5µs more accurate. With `SOF_TIMESTAMPING_RX_HARDWARE` (supported NIC required), the timestamp is taken at the NIC DMA for ~10ns accuracy. `tools/timestamp_validate` measures the userspace-read side of this tradeoff for real — see `BENCHMARK_RESULTS.md`.
+
+**`SO_RCVBUF` is verified, not assumed:** Linux silently clamps `SO_RCVBUF` to `net.core.rmem_max` (~208 KB on a stock kernel), so an 8 MB request can quietly become a fraction of that. `open()` tries `SO_RCVBUFFORCE`, falls back to `SO_RCVBUF`, reads back what was actually granted, and exposes `recv_buffer_shortfall()` — the `receiver` binary warns on it. See `docs/linux-tuning.md` §5a.
 
 **Busy-poll with `PAUSE`:** the receive loop calls `recvmsg(MSG_DONTWAIT)` in a tight loop with `__builtin_ia32_pause()` on empty returns. On a dedicated isolated core with `SCHED_FIFO`, this achieves the lowest possible receive latency. The `PAUSE` hint reduces memory bus traffic and power consumption during idle spins.
 
@@ -154,7 +163,8 @@ Generates synthetic PCAP files with controlled test patterns:
 ### `tools/tick_to_trade_bench`
 
 Measures the software tick-to-trade latency described above, end to end,
-with real numbers from an actual run — see `BENCHMARK_RESULTS.md`.
+with exact (sorted-sample) percentiles from an actual run — see
+`BENCHMARK_RESULTS.md`.
 
 ```bash
 ./tick_to_trade_bench --messages 200000 --warmup 20000 --symbols 8
@@ -226,7 +236,7 @@ ctest --test-dir build --output-on-failure
 
 ## Design decisions
 
-**Why not `epoll`?** For a co-located feed receiver, the goal is to minimise the time between a packet arriving at the NIC and being processed. `epoll` adds a syscall on each event; a busy-poll loop adds only the `recvmsg` cost. With a dedicated isolated core and `SCHED_FIFO` priority, busy-polling achieves ~1µs lower latency than event-driven I/O at the cost of 100% CPU usage on that core — a standard HFT trade-off.
+**Why not `epoll`?** For a co-located feed receiver, the goal is to minimise the time between a packet arriving at the NIC and being processed. `epoll` adds a syscall on each event; a busy-poll loop adds only the `recvmsg` cost. With a dedicated isolated core and `SCHED_FIFO` priority, busy-polling removes the `epoll_wait` syscall and the sleep/wake-up from the receive path at the cost of 100% CPU usage on that core — a standard HFT trade-off. (This repo does not benchmark busy-poll vs `epoll`; `timestamp_validate`'s measured `kernel_rx_sw_ts -> read` gap, ~1.2 µs p50 for a blocking `recvmsg`, is the wake-up cost busy-polling is designed to avoid.)
 
 **Why `#pragma pack` on PCAP headers?** The `PcapGlobalHeader` and `PcapRecordHeader` structs are read directly from disk with `fread`. Without `#pragma pack(1)`, the compiler may insert alignment padding that would misalign the `fread` into the struct fields. The PCAP format defines field offsets by byte position, not by natural alignment.
 

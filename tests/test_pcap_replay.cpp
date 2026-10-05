@@ -54,11 +54,11 @@ static std::vector<uint8_t> make_itch_add(uint64_t order_ref, char side,
     std::vector<uint8_t> body(36, 0);
     body[0] = uint8_t('A');
     // timestamp = 0 for simplicity
-    put_be64(body.data() + 7, order_ref);
-    body[15] = uint8_t(side);
-    put_be32(body.data() + 16, shares);
-    std::memcpy(body.data() + 20, "AAPL    ", 8);
-    put_be32(body.data() + 28, price);
+    put_be64(body.data() + 11, order_ref);
+    body[19] = uint8_t(side);
+    put_be32(body.data() + 20, shares);
+    std::memcpy(body.data() + 24, "AAPL    ", 8);
+    put_be32(body.data() + 32, price);
     return body;
 }
 

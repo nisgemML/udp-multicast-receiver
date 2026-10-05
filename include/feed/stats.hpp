@@ -1,23 +1,29 @@
 #pragma once
 // stats.hpp — Per-packet latency histogram and throughput tracker.
 //
-// Latency is measured as: kernel receive timestamp (SO_TIMESTAMPING) minus
-// the ITCH timestamp embedded in the message body.  This measures:
+// Two latency recorders, for two different jobs:
 //
-//   (time packet entered socket recv queue) - (time the exchange sent it)
+// LatencyHistogram — 64-bucket log2 histogram. O(1), allocation-free, safe to
+//   call on the hot path of a live receiver. The price is resolution: a sample
+//   is only known to lie in [2^i, 2^(i+1)). percentile() therefore returns the
+//   bucket's EXCLUSIVE UPPER BOUND, so "p99 < 1024 ns" is a true statement
+//   about the data. (An earlier version returned the lower bound 2^i, which
+//   understated every percentile by up to 2x and could print p99.9 below the
+//   mean.) Coarser than HDR Histogram, which subdivides each power of two.
 //
-// In co-location this is predominantly NIC-to-NIC network latency (~2-4 µs
-// for NASDAQ's matching engine to NY4).  On a VM or remote machine it includes
-// OS scheduling jitter and is much higher.
-//
-// We use a 64-bucket log₂ histogram for O(1) update and O(64) query.
-// This is the same approach as HDR Histogram but simplified for <1ms ranges.
+// SampleRecorder — stores every sample in a pre-reserved vector and sorts on
+//   report. Exact percentiles, O(n log n) query. Used by the offline
+//   benchmarks (tools/), where allocation-free recording does not matter and
+//   exact numbers do.
 
 #include <atomic>
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <bit>
+#include <algorithm>
+#include <cmath>
+#include <vector>
 
 namespace feed {
 
@@ -43,9 +49,9 @@ public:
         uint64_t cum = 0;
         for (int i = 0; i < kBuckets; ++i) {
             cum += counts_[i].load(std::memory_order_relaxed);
-            if (cum > target) return i == 0 ? 0ULL : 1ULL << i;
+            if (cum > target) return (i >= 63) ? ~0ULL : (1ULL << (i + 1));
         }
-        return 1ULL << (kBuckets - 1);
+        return ~0ULL;
     }
 
     [[nodiscard]] double mean_ns() const noexcept {
@@ -60,9 +66,45 @@ public:
 
     void print(const char* label = "") const noexcept {
         std::printf("%-20s  count=%7lu  mean=%6.0f ns  "
-                    "p50=%5lu ns  p99=%6lu ns  p99.9=%7lu ns\n",
+                    "p50<%5lu ns  p99<%6lu ns  p99.9<%7lu ns  (log2 buckets)\n",
                     label, count(), mean_ns(),
                     percentile(0.50), percentile(0.99), percentile(0.999));
+    }
+};
+
+// ── Exact-percentile recorder (offline benchmarks only) ─────────────────────
+
+class SampleRecorder {
+    std::vector<uint64_t> samples_;
+public:
+    explicit SampleRecorder(std::size_t reserve = 0) { samples_.reserve(reserve); }
+    void record(uint64_t ns) { samples_.push_back(ns); }
+    [[nodiscard]] std::size_t count() const noexcept { return samples_.size(); }
+
+    struct Summary { std::size_t n; double mean; uint64_t min, p50, p90, p99, p999, max; };
+
+    // Nearest-rank percentiles on a sorted copy.
+    [[nodiscard]] Summary summarize() const {
+        Summary r{samples_.size(), 0.0, 0, 0, 0, 0, 0, 0};
+        if (samples_.empty()) return r;
+        std::vector<uint64_t> v(samples_);
+        std::sort(v.begin(), v.end());
+        const auto at = [&](double p) {
+            std::size_t k = static_cast<std::size_t>(std::ceil(p * double(v.size())));
+            return v[k == 0 ? 0 : k - 1];
+        };
+        long double sum = 0;
+        for (auto x : v) sum += x;
+        r.mean = double(sum / v.size());
+        r.min = v.front(); r.max = v.back();
+        r.p50 = at(0.50); r.p90 = at(0.90); r.p99 = at(0.99); r.p999 = at(0.999);
+        return r;
+    }
+
+    void print(const char* label = "") const {
+        const auto s = summarize();
+        std::printf("%s\n  n=%zu  mean=%.0f  min=%lu  p50=%lu  p90=%lu  p99=%lu  p99.9=%lu  max=%lu  (ns, exact)\n",
+                    label, s.n, s.mean, s.min, s.p50, s.p90, s.p99, s.p999, s.max);
     }
 };
 

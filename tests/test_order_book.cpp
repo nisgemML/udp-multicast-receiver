@@ -35,11 +35,11 @@ static std::vector<uint8_t> make_add(uint64_t order_ref, char side, uint32_t sha
                                       const char* stock8, uint32_t price, bool mpid = false) {
     std::vector<uint8_t> b(36, 0);
     b[0] = uint8_t(mpid ? 'F' : 'A');
-    put_be64(b.data() + 7, order_ref);
-    b[15] = uint8_t(side);
-    put_be32(b.data() + 16, shares);
-    std::memcpy(b.data() + 20, stock8, 8);
-    put_be32(b.data() + 28, price);
+    put_be64(b.data() + 11, order_ref);
+    b[19] = uint8_t(side);
+    put_be32(b.data() + 20, shares);
+    std::memcpy(b.data() + 24, stock8, 8);
+    put_be32(b.data() + 32, price);
     return b;
 }
 

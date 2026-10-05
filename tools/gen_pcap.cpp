@@ -57,11 +57,11 @@ static void append_be16(std::vector<uint8_t>& v, uint16_t val) {
 static std::vector<uint8_t> make_add_order(uint64_t order_ref) {
     std::vector<uint8_t> body(36, 0);
     body[0] = uint8_t('A');
-    put_be64(body.data() + 7, order_ref);
-    body[15] = 'B';
-    put_be32(body.data() + 16, 100u);
-    std::memcpy(body.data() + 20, "AAPL    ", 8);
-    put_be32(body.data() + 28, 1'500'000u);
+    put_be64(body.data() + 11, order_ref);
+    body[19] = 'B';
+    put_be32(body.data() + 20, 100u);
+    std::memcpy(body.data() + 24, "AAPL    ", 8);
+    put_be32(body.data() + 32, 1'500'000u);
     return body;
 }
 

@@ -58,6 +58,9 @@ inline void put_be16(uint8_t* p, uint16_t v) noexcept {
 inline void put_be32(uint8_t* p, uint32_t v) noexcept {
     v = __builtin_bswap32(v); std::memcpy(p, &v, 4);
 }
+inline void put_be48(uint8_t* p, uint64_t v) noexcept {
+    for (int i = 0; i < 6; ++i) p[i] = uint8_t(v >> (40 - 8 * i));
+}
 inline void put_be64(uint8_t* p, uint64_t v) noexcept {
     v = __builtin_bswap64(v); std::memcpy(p, &v, 8);
 }
@@ -129,19 +132,46 @@ enum class ItchMsgType : uint8_t {
     return static_cast<ItchMsgType>(body[0]);
 }
 
-// ITCH timestamps are 6-byte big-endian nanoseconds since midnight.
-// All message bodies start: type(1) + timestamp(6).
+// ── ITCH 5.0 common message prefix ───────────────────────────────────────────
+//
+// Every ITCH 5.0 message body starts with the same 11-byte prefix
+// (NASDAQ TotalView-ITCH 5.0 specification, message format tables):
+//
+//   offset 0  len 1  Message Type
+//   offset 1  len 2  Stock Locate      (security id for this session)
+//   offset 3  len 2  Tracking Number   (NASDAQ internal)
+//   offset 5  len 6  Timestamp         (ns since midnight, big-endian)
+//
+// Message-specific fields begin at offset 11. An earlier version of this
+// file omitted Locate/Tracking on Add Order and read every timestamp from
+// offset 1; the test fixtures used the same wrong layout, so encoder and
+// decoder agreed with each other and every test passed. Golden byte
+// vectors in tests/test_wire_format.cpp, written directly from the spec
+// offsets rather than via any helper in this repo, now pin the layout.
+namespace itch_off {
+    inline constexpr std::size_t kType          = 0;
+    inline constexpr std::size_t kStockLocate   = 1;
+    inline constexpr std::size_t kTracking      = 3;
+    inline constexpr std::size_t kTimestamp     = 5;
+    inline constexpr std::size_t kBody          = 11;  // first message-specific field
+}
+
 [[nodiscard]] inline uint64_t itch_timestamp_ns(const uint8_t* body) noexcept {
-    return be48(body + 1);
+    return be48(body + itch_off::kTimestamp);
+}
+[[nodiscard]] inline uint16_t itch_stock_locate(const uint8_t* body) noexcept {
+    return be16(body + itch_off::kStockLocate);
 }
 
 // ── ITCH decoded message types ────────────────────────────────────────────────
 
-// Add Order (no MPID, 'A').  Body offsets after type byte:
-//   ts(6) order_ref(8) side(1) shares(4) stock(8) price(4) = 31 bytes + type = 36 - 1 = 35
+// Add Order ('A', 36 bytes; 'F' adds a 4-byte MPID at 36 = 40 bytes).
+//   type(0,1) locate(1,2) tracking(3,2) ts(5,6) order_ref(11,8) side(19,1)
+//   shares(20,4) stock(24,8) price(32,4)
 struct ItchAddOrder {
     uint64_t seq_num;
     uint64_t timestamp_ns;
+    uint16_t stock_locate;
     uint64_t order_ref;
     uint32_t shares;
     uint32_t price;      // fixed-point * 10000 ($12.3456 = 123456)
@@ -152,19 +182,20 @@ struct ItchAddOrder {
     [[nodiscard]] static bool parse(const uint8_t* body, std::size_t len,
                                      ItchAddOrder& out) noexcept {
         if (len < 36) return false;
-        out.timestamp_ns = be48(body + 1);
-        out.order_ref    = be64(body + 7);
-        out.side         = char(body[15]);
-        out.shares       = be32(body + 16);
-        std::memcpy(out.stock, body + 20, 8);
+        out.stock_locate = be16(body + 1);
+        out.timestamp_ns = be48(body + 5);
+        out.order_ref    = be64(body + 11);
+        out.side         = char(body[19]);
+        out.shares       = be32(body + 20);
+        std::memcpy(out.stock, body + 24, 8);
         out.stock[8]     = '\0';
-        out.price        = be32(body + 28);
+        out.price        = be32(body + 32);
         out.has_mpid     = (body[0] == uint8_t('F'));
         return true;
     }
 };
 
-// Order Delete ('D').  Body: type(1) ts(6) locate(2) tracking(2) order_ref(8) = 19
+// Order Delete ('D').  Body: type(1) locate(2) tracking(2) ts(6) order_ref(8) = 19
 struct ItchDeleteOrder {
     uint64_t seq_num;
     uint64_t timestamp_ns;
@@ -173,13 +204,13 @@ struct ItchDeleteOrder {
     [[nodiscard]] static bool parse(const uint8_t* body, std::size_t len,
                                      ItchDeleteOrder& out) noexcept {
         if (len < 19) return false;
-        out.timestamp_ns = be48(body + 1);
+        out.timestamp_ns = be48(body + 5);
         out.order_ref    = be64(body + 11);
         return true;
     }
 };
 
-// Order Executed ('E').  Body: type(1) ts(6) locate(2) tracking(2) order_ref(8) shares(4) match(8) = 31
+// Order Executed ('E').  Body: type(1) locate(2) tracking(2) ts(6) order_ref(8) shares(4) match(8) = 31
 struct ItchOrderExecuted {
     uint64_t seq_num;
     uint64_t timestamp_ns;
@@ -190,7 +221,7 @@ struct ItchOrderExecuted {
     [[nodiscard]] static bool parse(const uint8_t* body, std::size_t len,
                                      ItchOrderExecuted& out) noexcept {
         if (len < 31) return false;
-        out.timestamp_ns    = be48(body + 1);
+        out.timestamp_ns    = be48(body + 5);
         out.order_ref       = be64(body + 11);
         out.executed_shares = be32(body + 19);
         out.match_number    = be64(body + 23);
@@ -199,7 +230,7 @@ struct ItchOrderExecuted {
 };
 
 // Order Cancel ('X') — partial cancel, reduces resting shares without
-// removing the order. Body: type(1) ts(6) locate(2) tracking(2) order_ref(8)
+// removing the order. Body: type(1) locate(2) tracking(2) ts(6) order_ref(8)
 // cancelled_shares(4) = 23.
 struct ItchOrderCancel {
     uint64_t seq_num;
@@ -210,7 +241,7 @@ struct ItchOrderCancel {
     [[nodiscard]] static bool parse(const uint8_t* body, std::size_t len,
                                      ItchOrderCancel& out) noexcept {
         if (len < 23) return false;
-        out.timestamp_ns      = be48(body + 1);
+        out.timestamp_ns      = be48(body + 5);
         out.order_ref         = be64(body + 11);
         out.cancelled_shares  = be32(body + 19);
         return true;
@@ -219,7 +250,7 @@ struct ItchOrderCancel {
 
 // Order Replace ('U') — atomically deletes orig_order_ref and adds a new
 // order at new_order_ref with a fresh price/shares (used for order
-// modifications). Body: type(1) ts(6) locate(2) tracking(2)
+// modifications). Body: type(1) locate(2) tracking(2) ts(6)
 // orig_order_ref(8) new_order_ref(8) shares(4) price(4) = 35.
 struct ItchOrderReplace {
     uint64_t seq_num;
@@ -232,7 +263,7 @@ struct ItchOrderReplace {
     [[nodiscard]] static bool parse(const uint8_t* body, std::size_t len,
                                      ItchOrderReplace& out) noexcept {
         if (len < 35) return false;
-        out.timestamp_ns    = be48(body + 1);
+        out.timestamp_ns    = be48(body + 5);
         out.orig_order_ref  = be64(body + 11);
         out.new_order_ref   = be64(body + 19);
         out.shares          = be32(body + 27);

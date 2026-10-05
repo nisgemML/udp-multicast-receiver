@@ -101,47 +101,111 @@ static void test_mold_header_round_trip() {
 
 // ── ItchAddOrder parse ────────────────────────────────────────────────────────
 
-static void test_itch_add_order_parse() {
-    // Construct a synthetic 'A' message body (36 bytes minimum).
-    uint8_t body[36] = {};
-    body[0] = uint8_t('A');          // type
+// ── ITCH 5.0 golden vectors ──────────────────────────────────────────────────
+//
+// Every byte below is typed by hand from the NASDAQ TotalView-ITCH 5.0
+// message-format tables — deliberately NOT built with put_be*/any encoder in
+// this repo. A test whose fixture comes from the same code as the parser can
+// only prove the two agree with each other; this repo once shipped an Add
+// Order layout missing Stock Locate/Tracking Number that passed every test
+// for exactly that reason. These vectors pin the layout to the spec.
+//
+// Common prefix: type | locate(2) | tracking(2) | timestamp(6), fields at 11.
+// Values used throughout:
+//   locate    = 0x002A (42)
+//   tracking  = 0x0007
+//   timestamp = 0x1F1ACED9F000 = 34,200,000,000,000 ns = 09:30:00.000
 
-    // Timestamp: 6 bytes BE, value = 34200000000000 (9:30:00 in ns)
-    const uint64_t ts = 34200000000000ULL;
-    body[1] = uint8_t(ts >> 40);
-    body[2] = uint8_t(ts >> 32);
-    body[3] = uint8_t(ts >> 24);
-    body[4] = uint8_t(ts >> 16);
-    body[5] = uint8_t(ts >>  8);
-    body[6] = uint8_t(ts);
+static constexpr uint64_t kGoldenTs = 34'200'000'000'000ULL;
 
-    // order_ref = 12345 (8 bytes BE at offset 7)
-    put_be64(body + 7, 12345ULL);
-
-    // side = 'B'
-    body[15] = 'B';
-
-    // shares = 100 (4 bytes BE at offset 16)
-    put_be32(body + 16, 100u);
-
-    // stock = "AAPL    " (8 bytes at offset 20)
-    std::memcpy(body + 20, "AAPL    ", 8);
-
-    // price = 1500000 = $150.0000 (4 bytes BE at offset 28)
-    put_be32(body + 28, 1'500'000u);
-
+static void test_itch_add_order_golden() {
+    const uint8_t a[36] = {
+        'A',
+        0x00, 0x2A,                                     // 1  stock locate = 42
+        0x00, 0x07,                                     // 3  tracking
+        0x1F, 0x1A, 0xCE, 0xD9, 0xF0, 0x00,             // 5  timestamp
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x39, // 11 order ref = 12345
+        'B',                                            // 19 side
+        0x00, 0x00, 0x00, 0x64,                         // 20 shares = 100
+        'A', 'A', 'P', 'L', ' ', ' ', ' ', ' ',         // 24 stock
+        0x00, 0x16, 0xE3, 0x60,                         // 32 price = 1,500,000 ($150.0000)
+    };
     ItchAddOrder ao;
-    CHECK(ItchAddOrder::parse(body, 36, ao), "parse succeeds");
-    CHECK(ao.timestamp_ns == ts,          "timestamp_ns");
-    CHECK(ao.order_ref    == 12345ULL,    "order_ref");
-    CHECK(ao.side         == 'B',         "side");
-    CHECK(ao.shares       == 100u,        "shares");
-    CHECK(ao.price        == 1'500'000u,  "price");
-    CHECK(std::memcmp(ao.stock, "AAPL    ", 8) == 0, "stock");
-    CHECK(!ao.has_mpid,                   "no MPID for 'A' type");
+    CHECK(ItchAddOrder::parse(a, sizeof(a), ao), "A: parse succeeds");
+    CHECK(ao.stock_locate == 42,           "A: stock locate @1");
+    CHECK(ao.timestamp_ns == kGoldenTs,    "A: timestamp @5");
+    CHECK(itch_timestamp_ns(a) == kGoldenTs, "A: itch_timestamp_ns helper");
+    CHECK(ao.order_ref    == 12345ULL,     "A: order ref @11");
+    CHECK(ao.side         == 'B',          "A: side @19");
+    CHECK(ao.shares       == 100u,         "A: shares @20");
+    CHECK(std::memcmp(ao.stock, "AAPL    ", 8) == 0, "A: stock @24");
+    CHECK(ao.price        == 1'500'000u,   "A: price @32");
+    CHECK(!ao.has_mpid,                    "A: no MPID for 'A'");
+    CHECK(!ItchAddOrder::parse(a, 35, ao), "A: rejects short buffer");
+}
 
-    // Too short — should fail.
-    CHECK(!ItchAddOrder::parse(body, 35, ao), "parse fails on short buffer");
+static void test_itch_delete_golden() {
+    const uint8_t d[19] = {
+        'D', 0x00, 0x2A, 0x00, 0x07,
+        0x1F, 0x1A, 0xCE, 0xD9, 0xF0, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x39, // 11 order ref
+    };
+    ItchDeleteOrder m;
+    CHECK(ItchDeleteOrder::parse(d, sizeof(d), m), "D: parse succeeds");
+    CHECK(m.timestamp_ns == kGoldenTs,  "D: timestamp @5");
+    CHECK(m.order_ref    == 12345ULL,   "D: order ref @11");
+    CHECK(!ItchDeleteOrder::parse(d, 18, m), "D: rejects short buffer");
+}
+
+static void test_itch_cancel_golden() {
+    const uint8_t x[23] = {
+        'X', 0x00, 0x2A, 0x00, 0x07,
+        0x1F, 0x1A, 0xCE, 0xD9, 0xF0, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x39, // 11 order ref
+        0x00, 0x00, 0x00, 0x28,                         // 19 cancelled = 40
+    };
+    ItchOrderCancel m;
+    CHECK(ItchOrderCancel::parse(x, sizeof(x), m), "X: parse succeeds");
+    CHECK(m.timestamp_ns     == kGoldenTs, "X: timestamp @5");
+    CHECK(m.order_ref        == 12345ULL,  "X: order ref @11");
+    CHECK(m.cancelled_shares == 40u,       "X: cancelled shares @19");
+    CHECK(!ItchOrderCancel::parse(x, 22, m), "X: rejects short buffer");
+}
+
+static void test_itch_executed_golden() {
+    const uint8_t e[31] = {
+        'E', 0x00, 0x2A, 0x00, 0x07,
+        0x1F, 0x1A, 0xCE, 0xD9, 0xF0, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x39, // 11 order ref
+        0x00, 0x00, 0x00, 0x1E,                         // 19 executed = 30
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x86, 0xA0, // 23 match = 100000
+    };
+    ItchOrderExecuted m;
+    CHECK(ItchOrderExecuted::parse(e, sizeof(e), m), "E: parse succeeds");
+    CHECK(m.timestamp_ns    == kGoldenTs, "E: timestamp @5");
+    CHECK(m.order_ref       == 12345ULL,  "E: order ref @11");
+    CHECK(m.executed_shares == 30u,       "E: executed shares @19");
+    CHECK(m.match_number    == 100000ULL, "E: match number @23");
+    CHECK(!ItchOrderExecuted::parse(e, 30, m), "E: rejects short buffer");
+}
+
+static void test_itch_replace_golden() {
+    const uint8_t u[35] = {
+        'U', 0x00, 0x2A, 0x00, 0x07,
+        0x1F, 0x1A, 0xCE, 0xD9, 0xF0, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x39, // 11 orig ref = 12345
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x3A, // 19 new ref  = 12346
+        0x00, 0x00, 0x00, 0x96,                         // 27 shares = 150
+        0x00, 0x2D, 0xC8, 0x34,                         // 31 price  = 3,000,372
+    };
+    ItchOrderReplace m;
+    CHECK(ItchOrderReplace::parse(u, sizeof(u), m), "U: parse succeeds");
+    CHECK(m.timestamp_ns   == kGoldenTs,   "U: timestamp @5");
+    CHECK(m.orig_order_ref == 12345ULL,    "U: orig ref @11");
+    CHECK(m.new_order_ref  == 12346ULL,    "U: new ref @19");
+    CHECK(m.shares         == 150u,        "U: shares @27");
+    CHECK(m.price          == 3'000'372u,  "U: price @31");
+    CHECK(!ItchOrderReplace::parse(u, 34, m), "U: rejects short buffer");
 }
 
 // ── RetransmitRequest serialise ───────────────────────────────────────────────
@@ -191,7 +255,11 @@ int main() {
     test_mold_header_parse();
     test_mold_header_heartbeat();
     test_mold_header_round_trip();
-    test_itch_add_order_parse();
+    test_itch_add_order_golden();
+    test_itch_delete_golden();
+    test_itch_cancel_golden();
+    test_itch_executed_golden();
+    test_itch_replace_golden();
     test_retransmit_request();
     test_pcap_headers();
     test_itch_type_helper();

@@ -74,11 +74,11 @@ std::vector<uint8_t> make_add(uint64_t order_ref, char side, uint32_t shares,
                                const std::string& stock8, uint32_t price) {
     std::vector<uint8_t> b(36, 0);
     b[0] = 'A';
-    put_be64(b.data() + 7, order_ref);
-    b[15] = uint8_t(side);
-    put_be32(b.data() + 16, shares);
-    std::memcpy(b.data() + 20, stock8.data(), 8);
-    put_be32(b.data() + 28, price);
+    put_be64(b.data() + 11, order_ref);
+    b[19] = uint8_t(side);
+    put_be32(b.data() + 20, shares);
+    std::memcpy(b.data() + 24, stock8.data(), 8);
+    put_be32(b.data() + 32, price);
     return b;
 }
 
@@ -132,7 +132,16 @@ int main(int argc, char* argv[]) {
     std::vector<uint64_t> live_orders; // order_refs currently resting, for cancel/delete targets
     live_orders.reserve(opt.messages);
 
-    LatencyHistogram parse_latency; // pure GapBuffer::ingest() cost, for comparison
+    // Exact per-sample recorders (offline tool — allocation here is fine).
+    // NOTE: book updates and the decision rule run synchronously INSIDE
+    // GapBuffer::ingest() via callbacks, so the per-message timing below is
+    // the whole parse -> book -> decision path for that message, not parse alone.
+    SampleRecorder per_msg(opt.messages);
+    SampleRecorder per_decision(opt.messages);
+    bool recording = false;
+    engine.set_on_decision([&](const Decision& d) {
+        if (recording) per_decision.record(d.decided_ns - d.recv_ns);
+    });
 
     uint64_t seq = 1;
     uint64_t next_order_ref = 1;
@@ -169,11 +178,12 @@ int main(int argc, char* argv[]) {
 
         auto pkt = mold_packet("T2TBENCH  ", seq++, body);
 
+        recording = !warming;
         const uint64_t t0 = DecisionEngine::monotonic_ns();
         gap_buf.ingest(pkt.data(), pkt.size(), t0);
         const uint64_t t1 = DecisionEngine::monotonic_ns();
 
-        if (!warming) parse_latency.record(t1 - t0);
+        if (!warming) per_msg.record(t1 - t0);
     }
 
     std::printf("=== Tick-to-Trade Software Latency Benchmark ===\n");
@@ -183,9 +193,9 @@ int main(int argc, char* argv[]) {
     std::printf("Top-of-book events : %lu\n", engine.top_changes_seen());
     std::printf("Decisions emitted  : %lu\n", engine.decisions_emitted());
     std::printf("\n");
-    parse_latency.print("GapBuffer.ingest() only");
+    per_msg.print("Per message: ingest() incl. book update + decision callbacks (all messages)");
     std::printf("\n");
-    engine.latency().print("recv -> decision (full pipeline)");
+    per_decision.print("recv_ns -> decided_ns (messages that produced a decision)");
     std::printf("\n");
     std::printf("NOTE: 'recv -> decision' is a software-only pipeline latency\n");
     std::printf("(parse + book update + decision rule) measured in-process on\n");
